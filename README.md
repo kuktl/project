@@ -25,3 +25,7 @@ npm run dev
 Open http://localhost:3000.
 
 The API key must stay server-side and should never be committed to GitHub.
+
+## Deployment
+
+Production deployments are handled through Vercel from the `main` branch.
