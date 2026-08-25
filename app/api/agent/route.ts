@@ -2,6 +2,21 @@ import { NextRequest } from "next/server";
 
 export const runtime = "nodejs";
 
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const MODEL = "openai/gpt-5.5";
+
+function errorMessage(status: number, raw: string) {
+  try {
+    const parsed = JSON.parse(raw) as { error?: { message?: string } | string };
+    const value = parsed.error;
+    if (typeof value === "string") return value;
+    if (value?.message) return value.message;
+  } catch {
+    // Keep the raw response when it is not JSON.
+  }
+  return raw || `OpenRouter returned HTTP ${status}.`;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { command } = (await request.json()) as { command?: string };
@@ -10,7 +25,7 @@ export async function POST(request: NextRequest) {
       return Response.json({ error: "Command is required." }, { status: 400 });
     }
 
-    const apiKey = process.env.OPENROUTER_API_KEY;
+    const apiKey = process.env.OPENROUTER_API_KEY?.trim();
     if (!apiKey) {
       return Response.json(
         { error: "OPENROUTER_API_KEY is not configured on the server." },
@@ -18,14 +33,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const upstream = await fetch(OPENROUTER_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
+        "HTTP-Referer": process.env.NEXT_PUBLIC_SITE_URL || "https://project.vercel.app",
+        "X-Title": "Browser Agent",
       },
       body: JSON.stringify({
-        model: "openai/gpt-5.5",
+        model: MODEL,
         stream: true,
         messages: [
           {
@@ -40,9 +57,13 @@ export async function POST(request: NextRequest) {
 
     if (!upstream.ok || !upstream.body) {
       const details = await upstream.text();
-      console.error("OpenRouter request failed", upstream.status, details);
+      const message = errorMessage(upstream.status, details);
+      console.error("OpenRouter request failed", {
+        status: upstream.status,
+        message,
+      });
       return Response.json(
-        { error: "OpenRouter request failed." },
+        { error: `OpenRouter error (${upstream.status}): ${message}` },
         { status: 502 },
       );
     }
@@ -61,24 +82,33 @@ export async function POST(request: NextRequest) {
             if (done) break;
 
             buffer += decoder.decode(value, { stream: true });
-            const events = buffer.split("\n\n");
+            const events = buffer.split(/\r?\n\r?\n/);
             buffer = events.pop() ?? "";
 
             for (const event of events) {
-              for (const line of event.split("\n")) {
-                if (!line.startsWith("data: ")) continue;
+              for (const line of event.split(/\r?\n/)) {
+                if (!line.startsWith("data:")) continue;
 
-                const data = line.slice(6).trim();
+                const data = line.slice(5).trim();
                 if (!data || data === "[DONE]") continue;
 
                 try {
                   const parsed = JSON.parse(data) as {
                     choices?: Array<{ delta?: { content?: string | null } }>;
+                    error?: { message?: string };
                   };
+
+                  if (parsed.error?.message) {
+                    controller.enqueue(
+                      encoder.encode(`OpenRouter error: ${parsed.error.message}`),
+                    );
+                    continue;
+                  }
+
                   const content = parsed.choices?.[0]?.delta?.content;
                   if (content) controller.enqueue(encoder.encode(content));
                 } catch {
-                  // Ignore incomplete/non-JSON SSE frames.
+                  // Ignore malformed/incomplete SSE frames.
                 }
               }
             }
@@ -98,11 +128,13 @@ export async function POST(request: NextRequest) {
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
       },
     });
   } catch (error) {
     console.error("Agent request failed", error);
-    return Response.json({ error: "Agent request failed." }, { status: 500 });
+    return Response.json(
+      { error: error instanceof Error ? error.message : "Agent request failed." },
+      { status: 500 },
+    );
   }
 }
